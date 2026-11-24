@@ -764,8 +764,12 @@ func (ad *admin) totpStart(w http.ResponseWriter, r *http.Request, _ string) {
 
 func (ad *admin) totpEnable(w http.ResponseWriter, r *http.Request, _ string) {
 	sec := getSetting(ad.db, "totp_pending")
-	if sec == "" || !totp.Validate(strings.TrimSpace(r.PostForm.Get("code")), sec) {
-		back(w, r, "", "Code did not match; try again")
+	step := int64(-1)
+	if sec != "" {
+		step = totpStep(sec, r.PostForm.Get("code"), time.Now())
+	}
+	if step < 0 || !consumeTOTPStep(ad.db, getSetting(ad.db, "admin_user"), step) {
+		back(w, r, "", "Code did not match (or was already used); try again with the next code")
 		return
 	}
 	_ = setSetting(ad.db, "totp_secret", sec)

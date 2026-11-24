@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/pquerna/otp/totp"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -598,5 +599,55 @@ func TestClientIPUsesLastForwardedEntryFromLoopbackOnly(t *testing.T) {
 		if got := clientIP(c.r); got != c.want {
 			t.Errorf("%s: got %q want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestTOTPStepCannotBeReused(t *testing.T) {
+	a, au, _, mux := webEnv(t)
+	au.sleep = func(time.Duration) {}
+	key, err := totp.Generate(totp.GenerateOpts{Issuer: "t", AccountName: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = setSetting(a.db, "totp_secret", key.Secret())
+	T := time.Unix(1_800_000_000, 0)
+	au.totpNow = func() time.Time { return T }
+	codeAt := func(at time.Time) string {
+		c, _ := totp.GenerateCode(key.Secret(), at)
+		return c
+	}
+	login := func(code string) int {
+		r := form("POST", "/admin/login", url.Values{"username": {"admin"}, "password": {"correct horse battery"}, "totp": {code}})
+		r.RemoteAddr = "198.51.100." + strconv.Itoa(int(time.Now().UnixNano()%200)+1) + ":1"
+		return doReq(mux, r).Code
+	}
+	c0 := codeAt(T)
+	if got := login(c0); got != http.StatusSeeOther {
+		t.Fatalf("first use: %d", got)
+	}
+	if got := login(c0); got != 401 {
+		t.Fatalf("replay of used step accepted: %d", got)
+	}
+	// An earlier step inside the skew window is not usable after a later one was consumed.
+	if got := login(codeAt(T.Add(-30 * time.Second))); got != 401 {
+		t.Fatalf("older step accepted after newer: %d", got)
+	}
+	// The next step works once, then is burnt too.
+	T = T.Add(30 * time.Second)
+	c1 := codeAt(T)
+	if got := login(c1); got != http.StatusSeeOther {
+		t.Fatalf("next step refused: %d", got)
+	}
+	if got := login(c1); got != 401 {
+		t.Fatalf("replay of next step accepted: %d", got)
+	}
+	// A wrong password never burns a step.
+	T = T.Add(30 * time.Second)
+	c2 := codeAt(T)
+	r := form("POST", "/admin/login", url.Values{"username": {"admin"}, "password": {"wrong"}, "totp": {c2}})
+	r.RemoteAddr = "198.51.100.250:1"
+	doReq(mux, r)
+	if got := login(c2); got != http.StatusSeeOther {
+		t.Fatalf("step burnt by a failed password: %d", got)
 	}
 }

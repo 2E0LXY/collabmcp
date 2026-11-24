@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -54,6 +56,8 @@ type authServer struct {
 	acct   map[string]*failState // keyed by account name (slows only)
 	global []time.Time           // recent failures from anywhere (slows only)
 	sleep  func(time.Duration)
+
+	totpNow func() time.Time // test hook; nil means time.Now
 
 	regMu  sync.Mutex
 	regLog map[string][]time.Time
@@ -96,8 +100,34 @@ func purgeUnusedClients(db *sql.DB, now time.Time) {
 		AND id NOT IN (SELECT client_id FROM oauth_codes)`, now.Add(-unusedClientMaxAge).Unix())
 }
 
+// totpStep returns the 30-second step of the first code in the +-1 window that equals code, or -1.
+func totpStep(secret, code string, now time.Time) int64 {
+	code = strings.TrimSpace(code)
+	opts := totp.ValidateOpts{Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1}
+	cur := now.Unix() / 30
+	found := int64(-1)
+	for _, c := range []int64{cur - 1, cur, cur + 1} {
+		want, err := totp.GenerateCodeCustom(secret, time.Unix(c*30, 0), opts)
+		if err == nil && subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 {
+			found = c
+		}
+	}
+	return found
+}
+
+// consumeTOTPStep records step as used for account. It returns false when that step, or a later one,
+// was already used, so a code cannot be replayed within its validity window.
+func consumeTOTPStep(db *sql.DB, account string, step int64) bool {
+	k := "totp_last_step:" + acctKey(account)
+	_, _ = db.Exec(`INSERT OR IGNORE INTO settings(k,v) VALUES(?,'0')`, k)
+	res, err := db.Exec(`UPDATE settings SET v=? WHERE k=? AND CAST(v AS INTEGER) < ?`, strconv.FormatInt(step, 10), k, step)
+	n, nerr := rowsAffected(res, err)
+	return nerr == nil && n == 1
+}
+
 // credsOK checks username, password and (when enabled) the TOTP code.
-// Every check runs, so timing does not reveal which part was wrong.
+// Every check runs, so timing does not reveal which part was wrong. A TOTP code is accepted
+// once per account: a replay of an already-used time step fails.
 func (a *authServer) credsOK(user, pw, code string) bool {
 	hash := getSetting(a.db, "pw_hash")
 	if hash == "" {
@@ -105,11 +135,24 @@ func (a *authServer) credsOK(user, pw, code string) bool {
 	}
 	uOK := subtle.ConstantTimeCompare([]byte(user), []byte(getSetting(a.db, "admin_user"))) == 1
 	pOK := bcrypt.CompareHashAndPassword([]byte(hash), []byte(pw)) == nil
-	tOK := true
+	step := int64(0)
 	if sec := getSetting(a.db, "totp_secret"); sec != "" {
-		tOK = totp.Validate(strings.TrimSpace(code), sec)
+		now := time.Now
+		if a.totpNow != nil {
+			now = a.totpNow
+		}
+		step = totpStep(sec, code, now())
+		if step < 0 {
+			return false
+		}
 	}
-	return uOK && pOK && tOK
+	if !(uOK && pOK) {
+		return false
+	}
+	if step > 0 && !consumeTOTPStep(a.db, user, step) {
+		return false
+	}
+	return true
 }
 
 type failState struct {

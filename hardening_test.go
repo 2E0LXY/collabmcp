@@ -571,3 +571,32 @@ func TestMigrationGivesLegacyTokensAnExpiry(t *testing.T) {
 		t.Fatalf("legacy token still never expires: %d", e)
 	}
 }
+
+func TestClientIPUsesLastForwardedEntryFromLoopbackOnly(t *testing.T) {
+	mk := func(remote string, xff ...string) *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = remote
+		for _, x := range xff {
+			r.Header.Add("X-Forwarded-For", x)
+		}
+		return r
+	}
+	cases := []struct {
+		name string
+		r    *http.Request
+		want string
+	}{
+		{"caddy appended", mk("127.0.0.1:5000", "198.51.100.7"), "198.51.100.7"},
+		{"spoofed prefix ignored", mk("127.0.0.1:5000", "1.2.3.4, 9.9.9.9, 198.51.100.7"), "198.51.100.7"},
+		{"spoofed separate header lines", mk("[::1]:5000", "1.2.3.4", "198.51.100.8"), "198.51.100.8"},
+		{"IPv6 client", mk("127.0.0.1:5000", "10.0.0.1, 2001:db8::1"), "2001:db8::1"},
+		{"not from loopback: header ignored", mk("203.0.113.50:5000", "1.2.3.4"), "203.0.113.50"},
+		{"no header", mk("127.0.0.1:5000"), "127.0.0.1"},
+		{"garbage last entry falls back", mk("127.0.0.1:5000", "1.2.3.4, not-an-ip"), "127.0.0.1"},
+	}
+	for _, c := range cases {
+		if got := clientIP(c.r); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}

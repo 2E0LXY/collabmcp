@@ -128,10 +128,14 @@ func clientIP(r *http.Request) string {
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	// Trust X-Forwarded-For only from the local Caddy.
+	// Trust X-Forwarded-For only from the local Caddy, and then only the LAST entry: that is the
+	// address Caddy itself appended. Earlier entries are client-supplied and can be forged.
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.Split(xff, ",")[0])
+		for _, h := range r.Header.Values("X-Forwarded-For") {
+			parts := strings.Split(h, ",")
+			if c := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); c != nil {
+				host = c.String()
+			}
 		}
 	}
 	return host

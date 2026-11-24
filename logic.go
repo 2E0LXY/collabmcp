@@ -358,7 +358,9 @@ func (a *app) taskCreate(agent string, in taskCreateIn) (taskCreateOut, error) {
 	if !reProject.MatchString(in.Project) {
 		return taskCreateOut{}, errors.New("invalid project label")
 	}
-	if !a.projectExists(in.Project) {
+	if ok, err := a.projectExists(in.Project); err != nil {
+		return taskCreateOut{}, errors.New("could not check project")
+	} else if !ok {
 		return taskCreateOut{}, fmt.Errorf("unknown project %q: use an exact name from project_list", in.Project)
 	}
 	if err := validText(in.Title, 200, "title"); err != nil {
@@ -614,8 +616,14 @@ func (a *app) lockAcquire(agent string, in lockAcquireIn) (lockOut, error) {
 	if !reResource.MatchString(in.Resource) {
 		return lockOut{}, errors.New("invalid resource name")
 	}
-	if proj, _, ok := strings.Cut(in.Resource, "/"); !ok || !a.projectExists(proj) {
-		return lockOut{}, errors.New("resource must be <project>/<path> using an exact name from project_list")
+	proj, err := canonLockPath(in.Resource)
+	if err != nil {
+		return lockOut{}, err
+	}
+	if ok, err := a.projectExists(proj); err != nil {
+		return lockOut{}, errors.New("could not check project")
+	} else if !ok {
+		return lockOut{}, fmt.Errorf("unknown project %q: use an exact name from project_list", proj)
 	}
 	ttl := in.TTLS
 	if ttl == 0 {
@@ -632,7 +640,7 @@ func (a *app) lockAcquire(agent string, in lockAcquireIn) (lockOut, error) {
 	now := a.now().Unix()
 	var owner string
 	var exp int64
-	err := a.db.QueryRow(`SELECT owner,expires FROM locks WHERE resource=?`, in.Resource).Scan(&owner, &exp)
+	err = a.db.QueryRow(`SELECT owner,expires FROM locks WHERE resource=?`, in.Resource).Scan(&owner, &exp)
 	if err == nil && exp > now && owner != agent {
 		return lockOut{}, fmt.Errorf("resource is locked by %s for another %ds", owner, exp-now)
 	}
@@ -645,6 +653,9 @@ func (a *app) lockAcquire(agent string, in lockAcquireIn) (lockOut, error) {
 }
 
 func (a *app) lockRelease(agent string, in lockReleaseIn) (okOut, error) {
+	if _, err := canonLockPath(in.Resource); err != nil {
+		return okOut{}, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var owner string
@@ -688,9 +699,31 @@ type project struct {
 }
 
 // projectExists reports whether the owner has registered a project with this exact name.
-func (a *app) projectExists(name string) bool {
+func (a *app) projectExists(name string) (bool, error) {
 	var x int
-	return a.db.QueryRow(`SELECT 1 FROM projects WHERE name=?`, name).Scan(&x) == nil
+	err := a.db.QueryRow(`SELECT 1 FROM projects WHERE name=?`, name).Scan(&x)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	}
+	return false, err
+}
+
+// canonLockPath checks that a lock resource is a canonical <project>/<path>: no empty,
+// "." or ".." components and no surrounding whitespace, so one path has exactly one key.
+func canonLockPath(resource string) (project string, err error) {
+	proj, path, ok := strings.Cut(resource, "/")
+	if !ok || path == "" {
+		return "", errors.New("resource must be <project>/<path> using an exact name from project_list")
+	}
+	for _, c := range strings.Split(path, "/") {
+		if c == "" || c == "." || c == ".." || c != strings.TrimSpace(c) {
+			return "", errors.New("resource path must be canonical: no empty, '.' or '..' components, no surrounding spaces")
+		}
+	}
+	return proj, nil
 }
 
 func (a *app) loadProject(name string) (*project, error) {

@@ -462,3 +462,22 @@ func TestDefaultBranchCorrectedOnFetch(t *testing.T) {
 		t.Fatalf("branch start after correction: %v", err)
 	}
 }
+
+func TestDefaultBranchCorrectedAfterRemoteRenameFollowingFirstFetch(t *testing.T) {
+	a, _ := testApp(t)
+	remote := mkRemote(t)
+	addProject(t, a, "p", remote) // branch "main", exists
+	if _, err := a.gitFetch(ctxAs("claude"), "claude", projIn{Project: "p"}); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	// Remote renames its default AFTER the initial clone; the local bare HEAD is now stale.
+	gitRaw(t, remote, "branch", "-m", "main", "trunk")
+	gitRaw(t, remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+	if _, err := a.gitFetch(ctxAs("claude"), "claude", projIn{Project: "p"}); err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	p, err := a.loadProject("p")
+	if err != nil || p.Branch != "trunk" {
+		t.Fatalf("stale HEAD not handled: %v %v", p, err)
+	}
+}

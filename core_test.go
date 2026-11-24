@@ -396,12 +396,36 @@ func TestTaskAndLockRequireRegisteredProject(t *testing.T) {
 	if _, err := a.taskCreate("claude", taskCreateIn{Project: "p", Title: "x"}); err != nil {
 		t.Fatalf("registered project: %v", err)
 	}
-	for _, r := range []string{"nope/file.go", "p", "p-other"} {
+	for _, r := range []string{"nope/file.go", "p", "p-other", "p/", "p//a.go", "p/./a.go", "p/a/../b.go", "p/a/", "p/ a.go"} {
 		if _, err := a.lockAcquire("claude", lockAcquireIn{Resource: r}); err == nil {
 			t.Fatalf("lock %q must be refused", r)
 		}
 	}
 	if _, err := a.lockAcquire("claude", lockAcquireIn{Resource: "p/file.go"}); err != nil {
 		t.Fatalf("lock on registered project: %v", err)
+	}
+}
+
+func TestLockReleaseRejectsAliasesAndDoesNotCreateSecondKey(t *testing.T) {
+	a, _ := testAppWithProjects(t)
+	if _, err := a.lockAcquire("claude", lockAcquireIn{Resource: "p/src/a.go"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []string{"p//src/a.go", "p/src/./a.go", "p/src/a.go/"} {
+		if _, err := a.lockAcquire("chatgpt", lockAcquireIn{Resource: r}); err == nil {
+			t.Fatalf("alias %q must not create a separate lock", r)
+		}
+		if _, err := a.lockRelease("claude", lockReleaseIn{Resource: r}); err == nil {
+			t.Fatalf("release of alias %q must be refused", r)
+		}
+	}
+	if _, err := a.lockRelease("claude", lockReleaseIn{Resource: "p/src/a.go"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProductionGitTransportIsHTTPSOnly(t *testing.T) {
+	if defaultGitAllowProtocol != "https" {
+		t.Fatalf("production git transport must be https only, got %q", defaultGitAllowProtocol)
 	}
 }

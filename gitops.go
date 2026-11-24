@@ -166,7 +166,9 @@ func (g *gitx) worktree(project, agent string) string {
 }
 
 // gitAllowProtocol limits git transports. Production allows https only; tests widen it to local files.
-var gitAllowProtocol = "https"
+const defaultGitAllowProtocol = "https"
+
+var gitAllowProtocol = defaultGitAllowProtocol
 
 // hardenedArgs are prepended to every git invocation.
 var hardenedArgs = []string{

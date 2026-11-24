@@ -211,7 +211,7 @@ func (a *app) gitStatus(ctx context.Context, agent string, in projIn) (textOut, 
 		return textOut{}, err
 	}
 	s, err := a.git.run(ctx, gitOpts{cwd: wt}, "status", "--porcelain=v1", "-b")
-	return textOut{Output: s, Notice: repoNotice}, err
+	return textOut{Output: wrapRepo(s), Notice: repoNotice}, err
 }
 
 func (a *app) gitLog(ctx context.Context, agent string, in gitLogIn) (textOut, error) {
@@ -235,7 +235,7 @@ func (a *app) gitLog(ctx context.Context, agent string, in gitLogIn) (textOut, e
 	}
 	s, err := a.git.run(ctx, gitOpts{cwd: a.git.repoDir(p.Name)}, "log", "-n", fmt.Sprint(n),
 		"--no-color", "--format=%h %an %ad %s", "--date=short", ref, "--")
-	return textOut{Output: s, Notice: repoNotice}, err
+	return textOut{Output: wrapRepo(s), Notice: repoNotice}, err
 }
 
 const diffCap = 200 << 10
@@ -255,7 +255,7 @@ func (a *app) gitDiff(ctx context.Context, agent string, in gitDiffIn) (textOut,
 	if len(s) > diffCap {
 		s = s[:diffCap] + "\n[diff truncated]"
 	}
-	return textOut{Output: s, Notice: repoNotice}, err
+	return textOut{Output: wrapRepo(s), Notice: repoNotice}, err
 }
 
 func (a *app) gitShow(ctx context.Context, agent string, in gitShowIn) (textOut, error) {
@@ -278,7 +278,7 @@ func (a *app) gitShow(ctx context.Context, agent string, in gitShowIn) (textOut,
 	if len(s) > diffCap {
 		s = s[:diffCap] + "\n[truncated]"
 	}
-	return textOut{Output: s, Notice: repoNotice}, err
+	return textOut{Output: wrapRepo(s), Notice: repoNotice}, err
 }
 
 func (a *app) gitBranches(ctx context.Context, agent string, in projIn) (textOut, error) {
@@ -399,7 +399,7 @@ func (a *app) gitReadFile(ctx context.Context, agent string, in pathIn) (readFil
 	if !utf8.Valid(b) {
 		return readFileOut{}, errors.New("file is not valid UTF-8 text")
 	}
-	return readFileOut{Content: string(b), Notice: repoNotice}, nil
+	return readFileOut{Content: wrapRepo(string(b)), Notice: repoNotice}, nil
 }
 
 func (a *app) gitDiscard(ctx context.Context, agent string, in projIn) (okOut, error) {

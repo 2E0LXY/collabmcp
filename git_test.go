@@ -241,7 +241,7 @@ func TestGitFlowAndGuardrails(t *testing.T) {
 	if _, err := a.gitWriteFile(ctx, "claude", writeFileIn{p, "docs/new.md", "# new\n"}); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := a.gitReadFile(ctx, "claude", pathIn{p, "docs/new.md"}); err != nil || got.Content != "# new\n" {
+	if got, err := a.gitReadFile(ctx, "claude", pathIn{p, "docs/new.md"}); err != nil || !strings.Contains(got.Content, "\n# new\n\n[end of repository content ") {
 		t.Fatalf("read back: %+v %v", got, err)
 	}
 	cm, err := a.gitCommit(ctx, "claude", commitIn{p, "add docs"})
@@ -261,7 +261,7 @@ func TestGitFlowAndGuardrails(t *testing.T) {
 	if _, err := a.gitLog(ctx, "claude", gitLogIn{Project: p, Ref: "--output=/tmp/x"}); err == nil {
 		t.Fatal("option-like ref accepted")
 	}
-	if sh, err := a.gitShow(ctx, "claude", gitShowIn{p, "claude/feature", "docs/new.md"}); err != nil || sh.Output != "# new\n" {
+	if sh, err := a.gitShow(ctx, "claude", gitShowIn{p, "claude/feature", "docs/new.md"}); err != nil || !strings.Contains(sh.Output, "\n# new\n\n[end of repository content ") {
 		t.Fatalf("show: %+v %v", sh, err)
 	}
 	if _, err := a.gitShow(ctx, "claude", gitShowIn{Project: p, Rev: "claude/feature", Path: ".env"}); err == nil {

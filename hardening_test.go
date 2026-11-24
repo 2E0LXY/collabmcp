@@ -651,3 +651,29 @@ func TestTOTPStepCannotBeReused(t *testing.T) {
 		t.Fatalf("step burnt by a failed password: %d", got)
 	}
 }
+
+func TestServiceUnitHardening(t *testing.T) {
+	b, err := os.ReadFile("deploy/collabmcp.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]bool{}
+	for _, l := range strings.Split(string(b), "\n") {
+		have[strings.TrimSpace(l)] = true
+	}
+	for _, want := range []string{"SystemCallFilter=@system-service", "SystemCallArchitectures=native", "RestrictSUIDSGID=true",
+		"LockPersonality=true", "RestrictNamespaces=true", "ProtectKernelTunables=true", "ProtectKernelModules=true",
+		"ProtectControlGroups=true", "MemoryDenyWriteExecute=true", "NoNewPrivileges=true", "ProtectSystem=strict"} {
+		if !have[want] {
+			t.Errorf("unit lacks %s", want)
+		}
+	}
+	// git subprocesses must still be able to exec.
+	for _, bad := range []string{"NoExecPaths=", "ProtectProc=noaccess", "SystemCallFilter=~@process", "SystemCallFilter=~@privileged @process"} {
+		for l := range have {
+			if strings.HasPrefix(l, bad) {
+				t.Errorf("unit contains exec-breaking %q", l)
+			}
+		}
+	}
+}

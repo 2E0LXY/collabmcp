@@ -25,6 +25,12 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 LockPersonality=true
+RestrictSUIDSGID=true
+# Go and git never need writable+executable memory. git subprocesses still need execve, which
+# @system-service permits; do not add NoExecPaths or an @-group that removes process.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 MemoryMax=300M
 CapabilityBoundingSet=
 UMask=0077

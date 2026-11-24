@@ -215,18 +215,19 @@ pre{background:#f7f7f7;padding:.6rem;overflow:auto;font-size:13px;white-space:pr
 </div>
 
 <h2>Connected AI clients</h2>
-<table><tr><th>Client</th><th>Agent</th><th>Registered</th><th></th></tr>
-{{range .Clients}}<tr><td>{{.Name}}<br><small>{{.ID}}</small></td><td>{{.Agent}}</td><td>{{.Created}}</td>
+<table><tr><th>Client</th><th>Agent</th><th>Registered</th><th>Expires (UTC)</th><th>Last used (UTC)</th><th></th></tr>
+{{range .Clients}}<tr><td>{{.Name}}<br><small>{{.ID}}</small></td><td>{{.Agent}}</td><td>{{.Created}}</td><td>{{.Expires}}</td><td>{{.LastUsed}}</td>
 <td><form class="inline" method="post" action="/admin/clients/revoke"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger">Revoke</button></form></td></tr>
-{{else}}<tr><td colspan="4">None yet. Add <code>{{.Issuer}}/mcp</code> as a custom connector, then pick the agent at the authorise step.</td></tr>{{end}}</table>
+{{else}}<tr><td colspan="6">None yet. Add <code>{{.Issuer}}/mcp</code> as a custom connector, then pick the agent at the authorise step.</td></tr>{{end}}</table>
 
 <h2>API tokens</h2>
 {{if .NewToken}}<div class="card"><b>Copy this token now. It is shown once.</b><br><code>{{.NewToken}}</code><br><br>Or, for clients that only accept a URL (no auth needed):<br><code>{{.Issuer}}/mcp/{{.NewToken}}</code></div>{{end}}
 <form method="post" action="/admin/tokens/new"><input type="hidden" name="csrf" value="{{.CSRF}}">
 <div class="row"><label>Label<input name="label" placeholder="chatgpt-main" maxlength="40" required pattern="[A-Za-z0-9 ._-]+"></label>
-<label>Agent<select name="agent">{{range .Agents}}{{if .Enabled}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select></label></div>
+<label>Agent<select name="agent">{{range .Agents}}{{if .Enabled}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select></label>
+<label>Lifetime (days, blank for the default)<input name="days" inputmode="numeric" maxlength="4" placeholder="{{.TokenDays}}"></label></div>
 <button>Create token</button></form>
-<p><small>Use as <code>Authorization: Bearer TOKEN</code> on <code>{{.Issuer}}/mcp</code>. The token is bound to the chosen agent; revoke it under Connected AI clients.</small></p>
+<p><small>API tokens expire; the expiry and last use are listed under Connected AI clients. Use as <code>Authorization: Bearer TOKEN</code> on <code>{{.Issuer}}/mcp</code>. The token is bound to the chosen agent; revoke it under Connected AI clients.</small></p>
 
 <h2>Audit log (latest 100; kept 90 days)</h2>
 <table><tr><th>Time (UTC)</th><th>Actor</th><th>Tool</th><th>Detail</th><th>Result</th></tr>
@@ -243,7 +244,7 @@ type (
 		Name, Remote, Branch string
 		HasToken             bool
 	}
-	clientRow struct{ ID, Name, Agent, Created string }
+	clientRow struct{ ID, Name, Agent, Created, Expires, LastUsed string }
 	auditRow  struct{ TS, Actor, Tool, Detail, Result string }
 	mrRow     struct {
 		ID                              int64
@@ -273,6 +274,7 @@ type pageData struct {
 	PendingURI                   string
 	View, CSRF, Msg, Err, Issuer string
 	NewToken                     string
+	TokenDays                    int
 	Agents                       []agentRow
 	Projects                     []projRow
 	MRs                          []mrRow
@@ -299,7 +301,7 @@ func ts(t int64) string { return time.Unix(t, 0).UTC().Format("2006-01-02 15:04:
 func (ad *admin) dashboardData(csrf, msg, errMsg string) pageData {
 	d := pageData{View: "dash", CSRF: csrf, Msg: msg, Err: errMsg, Issuer: ad.auth.issuer,
 		TempPW: getSetting(ad.db, "pw_temp") == "1", TOTPOn: getSetting(ad.db, "totp_secret") != "",
-		AdminUser: getSetting(ad.db, "admin_user"), Paused: ad.app.paused()}
+		AdminUser: getSetting(ad.db, "admin_user"), Paused: ad.app.paused(), TokenDays: defaultTokenTTLDays()}
 	if sec := getSetting(ad.db, "totp_pending"); sec != "" && !d.TOTPOn {
 		d.PendingSecret = sec
 		d.PendingURI = fmt.Sprintf("otpauth://totp/collabmcp:%s?secret=%s&issuer=collabmcp", d.AdminUser, sec)
@@ -358,11 +360,24 @@ func (ad *admin) dashboardData(csrf, msg, errMsg string) pageData {
 			d.Board = append(d.Board, x)
 		}
 	})
-	each(`SELECT c.id,c.name,COALESCE((SELECT agent FROM oauth_tokens t WHERE t.client_id=c.id LIMIT 1),''),c.created FROM oauth_clients c ORDER BY c.created DESC LIMIT 50`, func(r scanner) {
+	each(`SELECT c.id,c.name,COALESCE((SELECT agent FROM oauth_tokens t WHERE t.client_id=c.id LIMIT 1),''),c.created,
+		COALESCE((SELECT MAX(expires) FROM oauth_tokens t WHERE t.client_id=c.id),0),
+		COALESCE((SELECT MAX(last_used) FROM oauth_tokens t WHERE t.client_id=c.id),0)
+		FROM oauth_clients c ORDER BY c.created DESC LIMIT 50`, func(r scanner) {
 		var x clientRow
-		var c int64
-		if r.Scan(&x.ID, &x.Name, &x.Agent, &c) == nil {
+		var c, e, lu int64
+		if r.Scan(&x.ID, &x.Name, &x.Agent, &c, &e, &lu) == nil {
 			x.Created = ts(c)
+			x.Expires, x.LastUsed = "none", "never"
+			if e > 0 {
+				x.Expires = ts(e)
+				if e < time.Now().Unix() {
+					x.Expires += " (expired)"
+				}
+			}
+			if lu > 0 {
+				x.LastUsed = ts(lu)
+			}
 			d.Clients = append(d.Clients, x)
 		}
 	})
@@ -649,15 +664,25 @@ func (ad *admin) tokenNew(w http.ResponseWriter, r *http.Request, _ string) {
 		back(w, r, "", "Choose an enabled agent")
 		return
 	}
+	days := defaultTokenTTLDays()
+	if s := strings.TrimSpace(r.PostForm.Get("days")); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 || n > 3650 {
+			back(w, r, "", "Lifetime: 1 to 3650 days")
+			return
+		}
+		days = n
+	}
+	expires := time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix()
 	id := randToken(16)
 	tok := "collab_" + randToken(32)
 	_, e1 := ad.db.Exec(`INSERT INTO oauth_clients(id,name,redirect_uris,created) VALUES(?,?,?,?)`, id, "API token: "+label, "[]", time.Now().Unix())
-	_, e2 := ad.db.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires) VALUES(?,?,?,?,?)`, hashToken(tok), "access", id, agent, int64(4102444800))
+	_, e2 := ad.db.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires) VALUES(?,?,?,?,?)`, hashToken(tok), "access", id, agent, expires)
 	if e1 != nil || e2 != nil {
 		back(w, r, "", "Could not create token")
 		return
 	}
-	audit(ad.db, "admin", "token_new", label+" agent="+agent, "ok")
+	audit(ad.db, "admin", "token_new", label+" agent="+agent+" days="+strconv.Itoa(days), "ok")
 	d := ad.dashboardData(csrf, "Token created for "+agent, "")
 	d.NewToken = tok
 	w.Header().Set("Cache-Control", "no-store")

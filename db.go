@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -117,12 +118,28 @@ func migrate(db *sql.DB) error {
 	for _, c := range [][3]string{
 		{"oauth_codes", "grant_id", "TEXT NOT NULL DEFAULT ''"},
 		{"oauth_tokens", "grant_id", "TEXT NOT NULL DEFAULT ''"},
+		{"oauth_tokens", "last_used", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := addColumn(db, c[0], c[1], c[2]); err != nil {
 			return err
 		}
 	}
-	return nil
+	// API tokens created before expiry existed carried a year-2100 sentinel: give them the default lifetime.
+	_, err := db.Exec(`UPDATE oauth_tokens SET expires=? WHERE expires >= ?`,
+		time.Now().Add(time.Duration(defaultTokenTTLDays())*24*time.Hour).Unix(), legacyNoExpiry)
+	return err
+}
+
+// legacyNoExpiry is the sentinel expiry that dashboard API tokens used before M8.
+const legacyNoExpiry = int64(4102444800)
+
+// defaultTokenTTLDays is the lifetime of dashboard API tokens (secret-path tokens): 90 days,
+// or COLLAB_TOKEN_TTL_DAYS (1-3650) when set.
+func defaultTokenTTLDays() int {
+	if n, err := strconv.Atoi(os.Getenv("COLLAB_TOKEN_TTL_DAYS")); err == nil && n >= 1 && n <= 3650 {
+		return n
+	}
+	return 90
 }
 
 func randToken(n int) string {

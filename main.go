@@ -140,10 +140,14 @@ func cmdTOTP(db *sql.DB, force bool) {
 
 // lookupToken resolves an access token to its client and bound agent.
 func lookupToken(db *sql.DB, tok string) (clientID, agent string, ok bool) {
-	var exp int64
-	err := db.QueryRow(`SELECT client_id,agent,expires FROM oauth_tokens WHERE hash=? AND kind='access'`, hashToken(tok)).Scan(&clientID, &agent, &exp)
-	if err != nil || tok == "" || time.Now().Unix() > exp {
+	var exp, last int64
+	err := db.QueryRow(`SELECT client_id,agent,expires,last_used FROM oauth_tokens WHERE hash=? AND kind='access'`, hashToken(tok)).Scan(&clientID, &agent, &exp, &last)
+	now := time.Now().Unix()
+	if err != nil || tok == "" || now > exp {
 		return "", "", false
+	}
+	if now-last >= 60 { // at most one write a minute per token
+		_, _ = db.Exec(`UPDATE oauth_tokens SET last_used=? WHERE hash=?`, now, hashToken(tok))
 	}
 	return clientID, agent, true
 }

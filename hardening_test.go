@@ -486,3 +486,88 @@ func TestApproveMRDoesNotBlockOtherToolsDuringSlowRemote(t *testing.T) {
 		t.Fatalf("approve: %v", err)
 	}
 }
+
+func TestSecretPathTokenExpiryAndLastUsed(t *testing.T) {
+	a, _, _, mux := webEnv(t)
+	ck, csrf := adminSession(t, a)
+	create := func(v url.Values) (*httptest.ResponseRecorder, string) {
+		v.Set("csrf", csrf)
+		req := form("POST", "/admin/tokens/new", v)
+		req.AddCookie(ck)
+		rr := doReq(mux, req)
+		i := strings.Index(rr.Body.String(), "collab_")
+		if i < 0 {
+			return rr, ""
+		}
+		return rr, rr.Body.String()[i : i+7+43]
+	}
+	exp := func(tok string) int64 {
+		var e int64
+		_ = a.db.QueryRow(`SELECT expires FROM oauth_tokens WHERE hash=?`, hashToken(tok)).Scan(&e)
+		return e
+	}
+	near := func(got int64, days int) bool {
+		want := time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix()
+		return got > want-120 && got < want+120
+	}
+	rr, tok := create(url.Values{"label": {"def"}, "agent": {"claude"}})
+	if tok == "" || !near(exp(tok), 90) {
+		t.Fatalf("default expiry is not 90 days: %d", exp(tok))
+	}
+	if !strings.Contains(rr.Body.String(), "Expires (UTC)") {
+		t.Error("dashboard lacks expiry column")
+	}
+	_, tok7 := create(url.Values{"label": {"week"}, "agent": {"claude"}, "days": {"7"}})
+	if !near(exp(tok7), 7) {
+		t.Errorf("configured expiry not applied: %d", exp(tok7))
+	}
+	if rr, bad := create(url.Values{"label": {"x"}, "agent": {"claude"}, "days": {"0"}}); bad != "" || rr.Code == 200 {
+		t.Error("days=0 accepted")
+	}
+	t.Setenv("COLLAB_TOKEN_TTL_DAYS", "30")
+	if _, tok30 := create(url.Values{"label": {"env"}, "agent": {"claude"}}); !near(exp(tok30), 30) {
+		t.Error("COLLAB_TOKEN_TTL_DAYS ignored")
+	}
+
+	// last-used is stamped when the secret path is used
+	var lu int64
+	_ = a.db.QueryRow(`SELECT last_used FROM oauth_tokens WHERE hash=?`, hashToken(tok)).Scan(&lu)
+	if lu != 0 {
+		t.Fatal("last_used set before use")
+	}
+	h := secretPath(a.db, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	if rr := doReq(h, httptest.NewRequest("POST", "/mcp/"+tok, nil)); rr.Code != 204 {
+		t.Fatalf("valid secret path: %d", rr.Code)
+	}
+	_ = a.db.QueryRow(`SELECT last_used FROM oauth_tokens WHERE hash=?`, hashToken(tok)).Scan(&lu)
+	if lu == 0 {
+		t.Error("last_used not recorded")
+	}
+	req := httptest.NewRequest("GET", "/admin", nil)
+	req.AddCookie(ck)
+	if pg := doReq(mux, req); strings.Contains(pg.Body.String(), "never") && !strings.Contains(pg.Body.String(), ts(lu)[:10]) {
+		t.Error("dashboard does not show last used")
+	}
+
+	// expired tokens are rejected on both the secret path and bearer path
+	_, _ = a.db.Exec(`UPDATE oauth_tokens SET expires=? WHERE hash=?`, time.Now().Unix()-1, hashToken(tok))
+	if rr := doReq(h, httptest.NewRequest("POST", "/mcp/"+tok, nil)); rr.Code != 404 {
+		t.Fatalf("expired secret-path token accepted: %d", rr.Code)
+	}
+	if _, _, ok := lookupToken(a.db, tok); ok {
+		t.Fatal("expired token accepted by lookup")
+	}
+}
+
+func TestMigrationGivesLegacyTokensAnExpiry(t *testing.T) {
+	a, _ := testApp(t)
+	_, _ = a.db.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires) VALUES('legacy','access','c','claude',?)`, legacyNoExpiry)
+	if err := migrate(a.db); err != nil {
+		t.Fatal(err)
+	}
+	var e int64
+	_ = a.db.QueryRow(`SELECT expires FROM oauth_tokens WHERE hash='legacy'`).Scan(&e)
+	if e >= legacyNoExpiry {
+		t.Fatalf("legacy token still never expires: %d", e)
+	}
+}

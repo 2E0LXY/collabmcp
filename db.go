@@ -80,12 +80,49 @@ func openDB(path string) (*sql.DB, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	for _, n := range []string{"claude", "chatgpt"} {
 		if _, err := db.Exec(`INSERT OR IGNORE INTO agents(name,enabled) VALUES(?,1)`, n); err != nil {
 			return nil, err
 		}
 	}
 	return db, nil
+}
+
+// addColumn adds a column to an existing table when it is not there yet.
+func addColumn(db *sql.DB, table, col, def string) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('` + table + `')`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil && n == col {
+			found = true
+		}
+	}
+	rows.Close()
+	if found {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col + ` ` + def)
+	return err
+}
+
+// migrate applies additive schema changes to databases created by earlier versions.
+func migrate(db *sql.DB) error {
+	for _, c := range [][3]string{
+		{"oauth_codes", "grant_id", "TEXT NOT NULL DEFAULT ''"},
+		{"oauth_tokens", "grant_id", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumn(db, c[0], c[1], c[2]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func randToken(n int) string {

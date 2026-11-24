@@ -2,11 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestWorkflowsPinLatestGoAndVulncheck(t *testing.T) {
@@ -179,4 +188,112 @@ func TestRepoContentWrapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	insideWrapper(t, "show commit", s.Output, forged)
+}
+
+// seedCode inserts an authorisation code with a valid PKCE pair and returns code and verifier.
+func seedCode(t *testing.T, a *app, client, redirect, agent, grant string) (string, string) {
+	t.Helper()
+	code, verifier := randToken(32), randToken(40)
+	sum := sha256.Sum256([]byte(verifier))
+	_, err := a.db.Exec(`INSERT INTO oauth_codes(hash,client_id,redirect_uri,challenge,agent,expires,grant_id) VALUES(?,?,?,?,?,?,?)`,
+		hashToken(code), client, redirect, base64.RawURLEncoding.EncodeToString(sum[:]), agent, time.Now().Add(time.Minute).Unix(), grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, verifier
+}
+
+func parallelPost(mux http.Handler, n int, mk func() *http.Request) []*httptest.ResponseRecorder {
+	out := make([]*httptest.ResponseRecorder, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := mk()
+			<-start
+			out[i] = doReq(mux, r)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	return out
+}
+
+func TestAuthCodeRedeemedExactlyOnceConcurrently(t *testing.T) {
+	a, _, _, mux := webEnv(t)
+	redirect := "https://claude.ai/cb"
+	for round := 0; round < 10; round++ {
+		code, verifier := seedCode(t, a, "cid", redirect, "claude", "g"+strconv.Itoa(round))
+		res := parallelPost(mux, 2, func() *http.Request {
+			return form("POST", "/token", url.Values{"grant_type": {"authorization_code"}, "code": {code},
+				"code_verifier": {verifier}, "client_id": {"cid"}, "redirect_uri": {redirect}})
+		})
+		ok := 0
+		for _, r := range res {
+			if r.Code == 200 {
+				ok++
+			}
+		}
+		if ok != 1 {
+			t.Fatalf("round %d: %d redemptions succeeded (want 1): %d %d", round, ok, res[0].Code, res[1].Code)
+		}
+	}
+}
+
+func TestRefreshTokenRotationReuseRevokesGrant(t *testing.T) {
+	a, _, _, mux := webEnv(t)
+	redirect := "https://claude.ai/cb"
+	code, verifier := seedCode(t, a, "cid", redirect, "claude", "grant1")
+	rr := doReq(mux, form("POST", "/token", url.Values{"grant_type": {"authorization_code"}, "code": {code},
+		"code_verifier": {verifier}, "client_id": {"cid"}, "redirect_uri": {redirect}}))
+	var t1 struct{ Access, Refresh string }
+	var m map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &m)
+	t1.Access, t1.Refresh = m["access_token"].(string), m["refresh_token"].(string)
+	// legitimate rotation
+	rr = doReq(mux, form("POST", "/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {t1.Refresh}, "client_id": {"cid"}}))
+	if rr.Code != 200 {
+		t.Fatalf("rotation: %d %s", rr.Code, rr.Body)
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &m)
+	newAccess := m["access_token"].(string)
+	if _, _, ok := lookupToken(a.db, newAccess); !ok {
+		t.Fatal("new access token not valid")
+	}
+	// replay of the spent refresh token: rejected, whole grant revoked
+	rr = doReq(mux, form("POST", "/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {t1.Refresh}, "client_id": {"cid"}}))
+	if rr.Code != 400 {
+		t.Fatalf("reuse accepted: %d", rr.Code)
+	}
+	if _, _, ok := lookupToken(a.db, newAccess); ok {
+		t.Error("access token of the grant survived refresh reuse")
+	}
+	if _, _, ok := lookupToken(a.db, t1.Access); ok {
+		t.Error("original access token survived refresh reuse")
+	}
+}
+
+func TestRefreshTokenConcurrentRedemption(t *testing.T) {
+	a, _, _, mux := webEnv(t)
+	redirect := "https://claude.ai/cb"
+	code, verifier := seedCode(t, a, "cid", redirect, "claude", "grant2")
+	rr := doReq(mux, form("POST", "/token", url.Values{"grant_type": {"authorization_code"}, "code": {code},
+		"code_verifier": {verifier}, "client_id": {"cid"}, "redirect_uri": {redirect}}))
+	var m map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &m)
+	rt := m["refresh_token"].(string)
+	res := parallelPost(mux, 2, func() *http.Request {
+		return form("POST", "/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {rt}, "client_id": {"cid"}})
+	})
+	ok := 0
+	for _, r := range res {
+		if r.Code == 200 {
+			ok++
+		}
+	}
+	if ok > 1 {
+		t.Fatalf("%d concurrent refreshes succeeded", ok)
+	}
 }

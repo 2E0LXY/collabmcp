@@ -358,8 +358,8 @@ func (a *authServer) authorizePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := randToken(32)
-	_, err = a.db.Exec(`INSERT INTO oauth_codes(hash,client_id,redirect_uri,challenge,agent,expires) VALUES(?,?,?,?,?,?)`,
-		hashToken(code), clientID, redirect, challenge, agent, time.Now().Add(codeTTL).Unix())
+	_, err = a.db.Exec(`INSERT INTO oauth_codes(hash,client_id,redirect_uri,challenge,agent,expires,grant_id) VALUES(?,?,?,?,?,?,?)`,
+		hashToken(code), clientID, redirect, challenge, agent, time.Now().Add(codeTTL).Unix(), randToken(12))
 	if err != nil {
 		http.Error(w, "server error", 500)
 		return
@@ -375,12 +375,35 @@ func (a *authServer) authorizePost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
-func (a *authServer) issue(clientID, agent string) map[string]any {
+// issue creates an access/refresh pair belonging to grant. Both rows are written in one transaction.
+func (a *authServer) issue(clientID, agent, grant string) (map[string]any, error) {
 	at, rt := randToken(32), randToken(32)
 	now := time.Now()
-	_, _ = a.db.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires) VALUES(?,?,?,?,?)`, hashToken(at), "access", clientID, agent, now.Add(accessTTL).Unix())
-	_, _ = a.db.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires) VALUES(?,?,?,?,?)`, hashToken(rt), "refresh", clientID, agent, now.Add(refreshTTL).Unix())
-	return map[string]any{"access_token": at, "token_type": "Bearer", "expires_in": int(accessTTL.Seconds()), "refresh_token": rt}
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	for _, r := range []struct {
+		tok, kind string
+		ttl       time.Duration
+	}{{at, "access", accessTTL}, {rt, "refresh", refreshTTL}} {
+		if _, err := tx.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires,grant_id) VALUES(?,?,?,?,?,?)`,
+			hashToken(r.tok), r.kind, clientID, agent, now.Add(r.ttl).Unix(), grant); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"access_token": at, "token_type": "Bearer", "expires_in": int(accessTTL.Seconds()), "refresh_token": rt}, nil
+}
+
+// revokeGrant removes every token (access, refresh and used-refresh tombstones) of one grant.
+func (a *authServer) revokeGrant(grant string) {
+	if grant != "" {
+		_, _ = a.db.Exec(`DELETE FROM oauth_tokens WHERE grant_id=?`, grant)
+	}
 }
 
 func (a *authServer) token(w http.ResponseWriter, r *http.Request) {
@@ -392,7 +415,7 @@ func (a *authServer) token(w http.ResponseWriter, r *http.Request) {
 	switch r.PostForm.Get("grant_type") {
 	case "authorization_code":
 		code, verifier := r.PostForm.Get("code"), r.PostForm.Get("code_verifier")
-		var clientID, redirect, challenge, agent string
+		var clientID, redirect, challenge, agent, grant string
 		var exp int64
 		tx, err := a.db.Begin()
 		if err != nil {
@@ -400,14 +423,19 @@ func (a *authServer) token(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer tx.Rollback()
-		err = tx.QueryRow(`SELECT client_id,redirect_uri,challenge,agent,expires FROM oauth_codes WHERE hash=?`, hashToken(code)).Scan(&clientID, &redirect, &challenge, &agent, &exp)
+		err = tx.QueryRow(`SELECT client_id,redirect_uri,challenge,agent,expires,grant_id FROM oauth_codes WHERE hash=?`, hashToken(code)).Scan(&clientID, &redirect, &challenge, &agent, &exp, &grant)
 		if err != nil {
 			oauthErr(w, 400, "invalid_grant", "unknown code")
 			return
 		}
-		_, _ = tx.Exec(`DELETE FROM oauth_codes WHERE hash=?`, hashToken(code)) // single use
+		// Single use: only the request whose DELETE removes the row may continue.
+		res, err := tx.Exec(`DELETE FROM oauth_codes WHERE hash=?`, hashToken(code))
+		if n, nerr := rowsAffected(res, err); nerr != nil || n != 1 {
+			oauthErr(w, 400, "invalid_grant", "code already used")
+			return
+		}
 		if err := tx.Commit(); err != nil {
-			oauthErr(w, 500, "server_error", "")
+			oauthErr(w, 400, "invalid_grant", "code already used")
 			return
 		}
 		sum := sha256.Sum256([]byte(verifier))
@@ -417,25 +445,72 @@ func (a *authServer) token(w http.ResponseWriter, r *http.Request) {
 			oauthErr(w, 400, "invalid_grant", "verification failed")
 			return
 		}
-		writeJSON(w, 200, a.issue(clientID, agent))
+		out, err := a.issue(clientID, agent, grant)
+		if err != nil {
+			oauthErr(w, 500, "server_error", "")
+			return
+		}
+		writeJSON(w, 200, out)
 	case "refresh_token":
 		rt := r.PostForm.Get("refresh_token")
-		var clientID, agent string
+		var clientID, agent, kind, grant string
 		var exp int64
-		err := a.db.QueryRow(`SELECT client_id,agent,expires FROM oauth_tokens WHERE hash=? AND kind='refresh'`, hashToken(rt)).Scan(&clientID, &agent, &exp)
+		tx, err := a.db.Begin()
+		if err != nil {
+			oauthErr(w, 500, "server_error", "")
+			return
+		}
+		defer tx.Rollback()
+		err = tx.QueryRow(`SELECT client_id,agent,expires,kind,grant_id FROM oauth_tokens WHERE hash=? AND kind IN ('refresh','refresh_used')`, hashToken(rt)).Scan(&clientID, &agent, &exp, &kind, &grant)
 		if err != nil || time.Now().Unix() > exp {
 			oauthErr(w, 400, "invalid_grant", "refresh token invalid")
+			return
+		}
+		if kind == "refresh_used" {
+			// A rotated refresh token came back: assume theft and revoke the whole grant.
+			_ = tx.Rollback()
+			a.revokeGrant(grant)
+			audit(a.db, "admin", "oauth_refresh_reuse", clientID, "grant revoked agent="+agent)
+			oauthErr(w, 400, "invalid_grant", "refresh token reused; grant revoked")
 			return
 		}
 		if cid := r.PostForm.Get("client_id"); cid != "" && cid != clientID {
 			oauthErr(w, 400, "invalid_grant", "client mismatch")
 			return
 		}
-		_, _ = a.db.Exec(`DELETE FROM oauth_tokens WHERE hash=?`, hashToken(rt)) // rotate
-		writeJSON(w, 200, a.issue(clientID, agent))
+		// Rotate: keep the spent token as a tombstone so reuse is detectable. Exactly one caller wins.
+		res, err := tx.Exec(`UPDATE oauth_tokens SET kind='refresh_used' WHERE hash=? AND kind='refresh'`, hashToken(rt))
+		if n, nerr := rowsAffected(res, err); nerr != nil || n != 1 {
+			_ = tx.Rollback()
+			a.revokeGrant(grant)
+			audit(a.db, "admin", "oauth_refresh_reuse", clientID, "concurrent redemption, grant revoked agent="+agent)
+			oauthErr(w, 400, "invalid_grant", "refresh token already used; grant revoked")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			oauthErr(w, 400, "invalid_grant", "refresh token already used")
+			return
+		}
+		if grant == "" {
+			grant = randToken(12)
+		}
+		out, err := a.issue(clientID, agent, grant)
+		if err != nil {
+			oauthErr(w, 500, "server_error", "")
+			return
+		}
+		writeJSON(w, 200, out)
 	default:
 		oauthErr(w, 400, "unsupported_grant_type", "")
 	}
+}
+
+// rowsAffected returns the affected-row count of an Exec result, folding in its error.
+func rowsAffected(res sql.Result, err error) (int64, error) {
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (a *authServer) agentOK(name string) bool {

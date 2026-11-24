@@ -303,7 +303,7 @@ func (a *app) boardThreads() (boardThreadsOut, error) {
 var taskStatuses = map[string]bool{"todo": true, "doing": true, "blocked": true, "review": true, "done": true}
 
 type taskCreateIn struct {
-	Project   string `json:"project" jsonschema:"project label"`
+	Project   string `json:"project" jsonschema:"exact project name from project_list"`
 	Title     string `json:"title" jsonschema:"short title (max 200 bytes)"`
 	Body      string `json:"body,omitempty" jsonschema:"details, max 8 KiB"`
 	DependsOn []int  `json:"depends_on,omitempty" jsonschema:"ids of tasks that must be done first"`
@@ -357,6 +357,9 @@ type taskOut struct {
 func (a *app) taskCreate(agent string, in taskCreateIn) (taskCreateOut, error) {
 	if !reProject.MatchString(in.Project) {
 		return taskCreateOut{}, errors.New("invalid project label")
+	}
+	if !a.projectExists(in.Project) {
+		return taskCreateOut{}, fmt.Errorf("unknown project %q: use an exact name from project_list", in.Project)
 	}
 	if err := validText(in.Title, 200, "title"); err != nil {
 		return taskCreateOut{}, err
@@ -611,6 +614,9 @@ func (a *app) lockAcquire(agent string, in lockAcquireIn) (lockOut, error) {
 	if !reResource.MatchString(in.Resource) {
 		return lockOut{}, errors.New("invalid resource name")
 	}
+	if proj, _, ok := strings.Cut(in.Resource, "/"); !ok || !a.projectExists(proj) {
+		return lockOut{}, errors.New("resource must be <project>/<path> using an exact name from project_list")
+	}
 	ttl := in.TTLS
 	if ttl == 0 {
 		ttl = 300
@@ -679,6 +685,12 @@ func (a *app) lockList(agent string) (lockListOut, error) {
 
 type project struct {
 	Name, Remote, Branch, Token string
+}
+
+// projectExists reports whether the owner has registered a project with this exact name.
+func (a *app) projectExists(name string) bool {
+	var x int
+	return a.db.QueryRow(`SELECT 1 FROM projects WHERE name=?`, name).Scan(&x) == nil
 }
 
 func (a *app) loadProject(name string) (*project, error) {

@@ -443,3 +443,22 @@ func TestProjectListHidesToken(t *testing.T) {
 		t.Fatal("token stored in clear")
 	}
 }
+
+func TestDefaultBranchCorrectedOnFetch(t *testing.T) {
+	a, _ := testApp(t)
+	remote := mkRemote(t)
+	// Rename the remote's default branch so the registered "main" no longer exists there.
+	gitRaw(t, remote, "branch", "-m", "main", "trunk")
+	gitRaw(t, remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+	addProject(t, a, "p", remote) // registered with branch "main"
+	if _, err := a.gitFetch(ctxAs("claude"), "claude", projIn{Project: "p"}); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	p, err := a.loadProject("p")
+	if err != nil || p.Branch != "trunk" {
+		t.Fatalf("default branch not corrected: %v %v", p, err)
+	}
+	if _, err := a.gitBranchStart(ctxAs("claude"), "claude", branchStartIn{Project: "p", Topic: "x"}); err != nil {
+		t.Fatalf("branch start after correction: %v", err)
+	}
+}

@@ -68,9 +68,11 @@ func mkRemote(t *testing.T) string {
 	return remote
 }
 
+func init() { gitAllowProtocol = "https:file" }
+
 func addProject(t *testing.T, a *app, name, remote string) {
 	t.Helper()
-	if _, err := a.db.Exec(`INSERT INTO projects(name,remote,branch,created) VALUES(?,?,?,?)`, name, remote, "main", time.Now().Unix()); err != nil {
+	if _, err := a.db.Exec(`INSERT OR REPLACE INTO projects(name,remote,branch,created) VALUES(?,?,?,?)`, name, remote, "main", time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -128,4 +130,14 @@ func toolList(t *testing.T, a *app) []map[string]any {
 		out = append(out, x.(map[string]any))
 	}
 	return out
+}
+
+// testAppWithProjects is testApp plus dummy registered projects "p" and "proj" for task and lock tests.
+func testAppWithProjects(t *testing.T) (*app, *clock) {
+	t.Helper()
+	a, c := testApp(t)
+	for _, n := range []string{"p", "proj"} {
+		_, _ = a.db.Exec(`INSERT OR IGNORE INTO projects(name,remote,branch,created) VALUES(?,?,?,?)`, n, "https://example.invalid/"+n, "main", 1)
+	}
+	return a, c
 }

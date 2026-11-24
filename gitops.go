@@ -165,6 +165,9 @@ func (g *gitx) worktree(project, agent string) string {
 	return filepath.Join(g.workRoot(project), agent)
 }
 
+// gitAllowProtocol limits git transports. Production allows https only; tests widen it to local files.
+var gitAllowProtocol = "https"
+
 // hardenedArgs are prepended to every git invocation.
 var hardenedArgs = []string{
 	"-c", "core.hooksPath=/dev/null",
@@ -224,7 +227,7 @@ func (g *gitx) run(ctx context.Context, o gitOpts, args ...string) (string, erro
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ALLOW_PROTOCOL=https:file",
+		"GIT_ALLOW_PROTOCOL=" + gitAllowProtocol,
 		"LC_ALL=C",
 	}
 	if o.token != "" {

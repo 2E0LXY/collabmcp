@@ -126,7 +126,28 @@ func (a *app) gitFetch(ctx context.Context, agent string, in projIn) (textOut, e
 	if err := a.git.fetch(ctx, p); err != nil {
 		return textOut{}, err
 	}
+	a.syncDefaultBranch(ctx, p)
 	return textOut{Output: "fetched"}, nil
+}
+
+// syncDefaultBranch corrects the stored default branch when it does not exist on the remote
+// but the remote's own default does (e.g. a project registered with the wrong branch).
+func (a *app) syncDefaultBranch(ctx context.Context, p *project) {
+	rd := gitOpts{cwd: a.git.repoDir(p.Name)}
+	if _, err := a.git.run(ctx, rd, "rev-parse", "--verify", "-q", "refs/remotes/origin/"+p.Branch); err == nil {
+		return
+	}
+	out, err := a.git.run(ctx, rd, "symbolic-ref", "--short", "-q", "HEAD")
+	b := strings.TrimSpace(out)
+	if err != nil || b == "" || b == p.Branch || !validBranchName(b) {
+		return
+	}
+	if _, err := a.git.run(ctx, rd, "rev-parse", "--verify", "-q", "refs/remotes/origin/"+b); err != nil {
+		return
+	}
+	if _, err := a.db.Exec(`UPDATE projects SET branch=? WHERE name=?`, b, p.Name); err == nil {
+		p.Branch = b
+	}
 }
 
 // ownWorktree returns the agent's worktree for a project, which must already exist.
@@ -257,6 +278,7 @@ func (a *app) gitBranchStart(ctx context.Context, agent string, in branchStartIn
 	if err := a.git.fetch(ctx, p); err != nil {
 		return branchStartOut{}, err
 	}
+	a.syncDefaultBranch(ctx, p)
 	wt, err := a.git.ensureWorktree(ctx, p, agent)
 	if err != nil {
 		return branchStartOut{}, err

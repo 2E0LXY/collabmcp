@@ -162,9 +162,20 @@ func (a *app) syncDefaultBranch(ctx context.Context, p *project) error {
 	if err != nil {
 		return errors.New("could not update the stored default branch")
 	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		p.Branch = b
+	n, err := res.RowsAffected()
+	if err != nil {
+		return errors.New("could not confirm the default branch update")
 	}
+	if n == 1 {
+		p.Branch = b
+		return nil
+	}
+	// Another call changed the stored branch first: use the current value, not the stale one.
+	cur, err := a.loadProject(p.Name)
+	if err != nil {
+		return err
+	}
+	p.Branch = cur.Branch
 	return nil
 }
 

@@ -429,3 +429,15 @@ func TestProductionGitTransportIsHTTPSOnly(t *testing.T) {
 		t.Fatalf("production git transport must be https only, got %q", defaultGitAllowProtocol)
 	}
 }
+
+func TestProductionGitTransportRefusesLocalFilesInSubprocess(t *testing.T) {
+	a, _ := testApp(t)
+	remote := mkRemote(t)
+	addProject(t, a, "p", remote)
+	old := gitAllowProtocol
+	gitAllowProtocol = defaultGitAllowProtocol
+	defer func() { gitAllowProtocol = old }()
+	if _, err := a.gitFetch(ctxAs("claude"), "claude", projIn{Project: "p"}); err == nil {
+		t.Fatal("git must refuse the file transport under the production policy")
+	}
+}

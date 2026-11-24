@@ -299,8 +299,7 @@ func (a *app) gitBranchStart(ctx context.Context, agent string, in branchStartIn
 		return branchStartOut{}, errors.New("invalid topic (lowercase letters, digits, . _ -)")
 	}
 	branch := agent + "/" + in.Topic
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	defer a.lockProject(p.Name)()
 	if err := a.git.ensureRepo(ctx, p); err != nil {
 		return branchStartOut{}, err
 	}
@@ -537,8 +536,7 @@ func (a *app) mergeRequest(ctx context.Context, agent string, in mrCreateIn) (mr
 	if err := validText(in.Summary, maxSummary, "summary"); err != nil {
 		return mrCreateOut{}, err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	defer a.lockProject(p.Name)()
 	wt, b, err := a.ownBranchWorktree(ctx, p, agent)
 	if err != nil {
 		return mrCreateOut{}, err
@@ -671,11 +669,16 @@ func (a *app) peerApproval(id int64, author string) (approvals, changes int) {
 
 // approveMR is called ONLY from the dashboard handler after the human clicks Approve.
 // No MCP tool reaches it.
+// Only the per-project lock is held while git runs, so other tools stay responsive during a slow remote.
 func (a *app) approveMR(ctx context.Context, id int64, override bool) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var proj, author, branch, head, status string
-	if a.db.QueryRow(`SELECT project,author,branch,head_sha,status FROM merge_requests WHERE id=?`, id).Scan(&proj, &author, &branch, &head, &status) != nil {
+	var proj string
+	if a.db.QueryRow(`SELECT project FROM merge_requests WHERE id=?`, id).Scan(&proj) != nil {
+		return errors.New("merge request not found")
+	}
+	defer a.lockProject(proj)()
+	// Re-read under the project lock: a concurrent approval of the same request may have finished.
+	var author, branch, head, status string
+	if a.db.QueryRow(`SELECT author,branch,head_sha,status FROM merge_requests WHERE id=?`, id).Scan(&author, &branch, &head, &status) != nil {
 		return errors.New("merge request not found")
 	}
 	if status != "open" {

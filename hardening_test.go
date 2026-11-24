@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -408,5 +409,80 @@ func TestAccountThrottleDoesNotBlockValidCredentials(t *testing.T) {
 	}
 	if rr := loginAs(mux, "198.51.100.200", "admin", "correct horse battery"); rr.Code != http.StatusSeeOther {
 		t.Fatalf("valid credentials refused while account under attack: %d", rr.Code)
+	}
+}
+
+// slowGitOnPush puts a git wrapper first on PATH that announces and then stalls any push,
+// standing in for a slow remote. It returns the marker file written when a push starts.
+func slowGitOnPush(t *testing.T, stall string) string {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "push-started")
+	script := "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = push ]; then touch '" + marker + "'; sleep " + stall + "; fi; done\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	return marker
+}
+
+func TestApproveMRDoesNotBlockOtherToolsDuringSlowRemote(t *testing.T) {
+	a, _, p := gitFixture(t)
+	ctx := context.Background()
+	_, _ = a.gitBranchStart(ctx, "claude", branchStartIn{p, "slow"})
+	_, _ = a.gitWriteFile(ctx, "claude", writeFileIn{p, "f.txt", "x\n"})
+	if _, err := a.gitCommit(ctx, "claude", commitIn{p, "slow"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.gitPush(ctx, "claude", projIn{p}); err != nil {
+		t.Fatal(err)
+	}
+	mr, err := a.mergeRequest(ctx, "claude", mrCreateIn{p, "slow remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = a.db.Exec(`INSERT INTO projects(name,remote,branch,created) VALUES('other','https://example.invalid/o','main',1)`)
+
+	marker := slowGitOnPush(t, "3")
+	done := make(chan error, 1)
+	go func() { done <- a.approveMR(ctx, mr.ID, true) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for !pathExists(marker) {
+		if time.Now().After(deadline) {
+			t.Fatal("approval never reached the push")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// While the push stalls, other tools must answer promptly.
+	start := time.Now()
+	if _, err := a.boardPost("chatgpt", boardPostIn{"t", "note", "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.taskCreate("chatgpt", taskCreateIn{Project: "other", Title: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.lockAcquire("chatgpt", lockAcquireIn{Resource: "other/x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.mrList("chatgpt", mrListIn{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.taskClaim("chatgpt", taskClaimIn{ID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 1500*time.Millisecond {
+		t.Fatalf("tools blocked behind the slow merge: %v", d)
+	}
+	select {
+	case <-done:
+		t.Fatal("approval finished before the stall ended; test is not exercising the slow path")
+	default:
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("approve: %v", err)
 	}
 }

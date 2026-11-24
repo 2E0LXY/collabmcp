@@ -1,0 +1,33 @@
+[Unit]
+Description=collabmcp: two-agent collaboration server for MCP clients
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=collabmcp
+Group=collabmcp
+Environment=COLLAB_DIR=/var/lib/collabmcp
+Environment=COLLAB_ISSUER=https://collab.2e0lxy.uk
+Environment=COLLAB_ADDR=127.0.0.1:8766
+ExecStart=/opt/collabmcp/collabmcp serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+# Must match COLLAB_DIR above.
+ReadWritePaths=/var/lib/collabmcp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryMax=300M
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

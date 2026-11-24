@@ -1,0 +1,4 @@
+collabmcp
+*.db
+*.db-*
+master.key

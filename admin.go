@@ -453,12 +453,12 @@ func (ad *admin) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ad.auth.credsOK(r.PostForm.Get("username"), r.PostForm.Get("password"), r.PostForm.Get("totp")) {
-		ad.auth.recordFail(ip)
+		ad.auth.recordFail(ip, r.PostForm.Get("username"))
 		audit(ad.db, "admin", "admin_login", ip, "failed")
 		ad.render(w, 401, pageData{View: "login", Err: "Invalid credentials."})
 		return
 	}
-	ad.auth.recordOK(ip)
+	ad.auth.recordOK(ip, r.PostForm.Get("username"))
 	audit(ad.db, "admin", "admin_login", ip, "ok")
 	ad.newSession(w)
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
@@ -673,7 +673,7 @@ func (ad *admin) verifyCurrent(r *http.Request) bool {
 	}
 	ok := bcrypt.CompareHashAndPassword([]byte(getSetting(ad.db, "pw_hash")), []byte(r.PostForm.Get("current"))) == nil
 	if !ok {
-		ad.auth.recordFail(ip)
+		ad.auth.recordFail(ip, getSetting(ad.db, "admin_user"))
 		audit(ad.db, "admin", "account", ip, "current password wrong")
 	}
 	return ok

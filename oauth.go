@@ -49,10 +49,11 @@ type authServer struct {
 	db     *sql.DB
 	issuer string
 
-	mu          sync.Mutex
-	fails       map[string]*failState
-	global      []time.Time
-	globalUntil time.Time
+	mu     sync.Mutex
+	fails  map[string]*failState // keyed by IP, and by IP|account
+	acct   map[string]*failState // keyed by account name (slows only)
+	global []time.Time           // recent failures from anywhere (slows only)
+	sleep  func(time.Duration)
 
 	regMu  sync.Mutex
 	regLog map[string][]time.Time
@@ -118,7 +119,8 @@ type failState struct {
 }
 
 func newAuthServer(db *sql.DB, issuer string) *authServer {
-	return &authServer{db: db, issuer: strings.TrimRight(issuer, "/"), fails: map[string]*failState{}}
+	return &authServer{db: db, issuer: strings.TrimRight(issuer, "/"), fails: map[string]*failState{},
+		acct: map[string]*failState{}, sleep: time.Sleep}
 }
 
 func clientIP(r *http.Request) string {
@@ -135,54 +137,98 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// Login throttling. Hard lockouts are keyed by client IP (and by IP plus account name), so a
+// third party can lock out only their own address, never the owner. Per-account and global
+// failure counts only slow failed attempts down; a correct credential is never delayed or refused
+// by them.
+const (
+	ipFailLimit      = 5
+	ipLockFor        = 30 * time.Minute
+	acctSlowAfter    = 3
+	globalSlowAfter  = 30
+	globalWindow     = 10 * time.Minute
+	maxFailDelay     = 3 * time.Second
+	failStateEntries = 10000
+)
+
+func acctKey(user string) string {
+	user = strings.ToLower(strings.TrimSpace(user))
+	if len(user) > 64 {
+		user = user[:64]
+	}
+	return user
+}
+
+// locked reports whether this client IP is hard-locked.
 func (a *authServer) locked(ip string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if time.Now().Before(a.globalUntil) {
-		return true
-	}
 	f := a.fails[ip]
 	return f != nil && time.Now().Before(f.until)
 }
 
-func (a *authServer) recordFail(ip string) {
+// recordFail notes a failed attempt from ip against account and then sleeps for the soft delay.
+func (a *authServer) recordFail(ip, account string) {
+	d := a.noteFail(ip, account)
+	if d > 0 && a.sleep != nil {
+		a.sleep(d)
+	}
+}
+
+func (a *authServer) noteFail(ip, account string) time.Duration {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// Global throttle: 30 failures in 10 minutes from anywhere pauses all logins for 10 minutes.
 	now := time.Now()
 	keep := a.global[:0]
 	for _, t := range a.global {
-		if now.Sub(t) < 10*time.Minute {
+		if now.Sub(t) < globalWindow {
 			keep = append(keep, t)
 		}
 	}
 	a.global = append(keep, now)
-	if len(a.global) >= 30 {
-		a.globalUntil = now.Add(10 * time.Minute)
-		a.global = nil
+
+	bump := func(m map[string]*failState, key string, limit int, lock time.Duration) *failState {
+		f := m[key]
+		if f == nil {
+			f = &failState{}
+			m[key] = f
+		}
+		if now.Sub(f.last) > time.Hour {
+			f.n = 0
+		}
+		f.n++
+		f.last = now
+		if limit > 0 && f.n >= limit {
+			f.until = now.Add(lock)
+			f.n = 0
+		}
+		return f
 	}
-	f := a.fails[ip]
-	if f == nil {
-		f = &failState{}
-		a.fails[ip] = f
+	bump(a.fails, ip, ipFailLimit, ipLockFor)
+	// Per IP and account: a lock that cannot affect any other address.
+	bump(a.fails, ip+"|"+acctKey(account), ipFailLimit, ipLockFor)
+	af := bump(a.acct, acctKey(account), 0, 0)
+	if len(a.fails) > failStateEntries || len(a.acct) > failStateEntries {
+		a.fails, a.acct = map[string]*failState{}, map[string]*failState{}
 	}
-	if time.Since(f.last) > time.Hour {
-		f.n = 0
+	var d time.Duration
+	if af.n > acctSlowAfter {
+		d = time.Duration(af.n-acctSlowAfter) * 250 * time.Millisecond
 	}
-	f.n++
-	f.last = time.Now()
-	if f.n >= 5 {
-		f.until = time.Now().Add(30 * time.Minute)
-		f.n = 0
+	if len(a.global) > globalSlowAfter {
+		d += time.Duration(len(a.global)-globalSlowAfter) * 100 * time.Millisecond
 	}
-	if len(a.fails) > 10000 {
-		a.fails = map[string]*failState{}
+	if d > maxFailDelay {
+		d = maxFailDelay
 	}
+	return d
 }
 
-func (a *authServer) recordOK(ip string) {
+func (a *authServer) recordOK(ip, account string) {
 	a.mu.Lock()
 	delete(a.fails, ip)
+	delete(a.fails, ip+"|"+acctKey(account))
+	delete(a.acct, acctKey(account))
 	a.mu.Unlock()
 }
 
@@ -396,12 +442,12 @@ func (a *authServer) authorizePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a.credsOK(f.Get("username"), f.Get("password"), f.Get("totp")) {
-		a.recordFail(ip)
+		a.recordFail(ip, f.Get("username"))
 		audit(a.db, "admin", "oauth_login", ip, "failed")
 		rerender(401, "Invalid credentials.")
 		return
 	}
-	a.recordOK(ip)
+	a.recordOK(ip, f.Get("username"))
 	agent := f.Get("agent")
 	if !a.agentOK(agent) {
 		rerender(400, "Choose an enabled agent.")

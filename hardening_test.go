@@ -351,3 +351,62 @@ func TestRegisterTotalCapAndPurgeOfUnusedClients(t *testing.T) {
 		t.Fatal("unused old client not purged")
 	}
 }
+
+func loginAs(mux http.Handler, ip, user, pw string) *httptest.ResponseRecorder {
+	r := form("POST", "/admin/login", url.Values{"username": {user}, "password": {pw}})
+	r.RemoteAddr = ip + ":4000"
+	return doReq(mux, r)
+}
+
+func TestLoginLockoutIsPerIPNotGlobal(t *testing.T) {
+	_, au, _, mux := webEnv(t)
+	var slept []time.Duration
+	au.sleep = func(d time.Duration) { slept = append(slept, d) }
+	// An attacker locks out their own address.
+	for i := 0; i < ipFailLimit; i++ {
+		if rr := loginAs(mux, "198.51.100.1", "admin", "wrong"); rr.Code != 401 {
+			t.Fatalf("attempt %d: %d", i, rr.Code)
+		}
+	}
+	if rr := loginAs(mux, "198.51.100.1", "admin", "wrong"); rr.Code != 429 {
+		t.Fatalf("attacker IP not locked: %d", rr.Code)
+	}
+	// Hundreds of failures from many other addresses against the owner's account name.
+	for i := 0; i < 120; i++ {
+		ip := "192.0.2." + strconv.Itoa(i%250+1)
+		if i >= 100 {
+			ip = "203.0.113." + strconv.Itoa(i)
+		}
+		loginAs(mux, ip, "admin", "wrong"+strconv.Itoa(i))
+	}
+	// The owner, from a different address with the right password, is not locked out and not delayed.
+	before := len(slept)
+	rr := loginAs(mux, "100.64.0.9", "admin", "correct horse battery")
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("owner locked out by third parties: %d", rr.Code)
+	}
+	if len(slept) != before {
+		t.Error("successful login was delayed")
+	}
+	// The global/account throttle slows failures but is capped.
+	max := time.Duration(0)
+	for _, d := range slept {
+		if d > max {
+			max = d
+		}
+	}
+	if max == 0 || max > maxFailDelay {
+		t.Errorf("soft delay missing or uncapped: max=%v", max)
+	}
+}
+
+func TestAccountThrottleDoesNotBlockValidCredentials(t *testing.T) {
+	_, au, _, mux := webEnv(t)
+	au.sleep = func(time.Duration) {}
+	for i := 0; i < 25; i++ {
+		loginAs(mux, "198.51.100."+strconv.Itoa(i+10), "admin", "wrong")
+	}
+	if rr := loginAs(mux, "198.51.100.200", "admin", "correct horse battery"); rr.Code != http.StatusSeeOther {
+		t.Fatalf("valid credentials refused while account under attack: %d", rr.Code)
+	}
+}

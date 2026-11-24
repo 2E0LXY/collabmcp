@@ -49,8 +49,25 @@ func isDotGit(c string) bool {
 	return l == ".git" || l == "git~1" || l == ".gitmodules"
 }
 
-// checkRelPath validates a repo-relative path lexically.
-func checkRelPath(p string) error {
+// isCIPath reports whether a path component names CI/CD configuration. Agents must not
+// write these: a workflow change runs with repository secrets once merged or pushed.
+func isCIPath(c string) bool {
+	l := strings.ToLower(strings.TrimRight(c, ". "))
+	switch l {
+	case ".github", ".gitlab-ci.yml", ".circleci", "azure-pipelines.yml", "jenkinsfile":
+		return true
+	}
+	return false
+}
+
+// checkRelPath validates a repo-relative path lexically, for writes, deletes and commits
+// (CI configuration is off limits).
+func checkRelPath(p string) error { return checkPath(p, true) }
+
+// checkRelPathRead is the read-side variant: identical except that CI configuration may be read.
+func checkRelPathRead(p string) error { return checkPath(p, false) }
+
+func checkPath(p string, blockCI bool) error {
 	switch {
 	case p == "":
 		return pathErr("empty")
@@ -72,6 +89,8 @@ func checkRelPath(p string) error {
 			return pathErr("'..' is not allowed")
 		case isDotGit(c):
 			return pathErr("anything under .git is off limits")
+		case blockCI && isCIPath(c):
+			return pathErr("CI/CD configuration (.github, .gitlab-ci.yml, .circleci, azure-pipelines.yml, Jenkinsfile) is off limits")
 		case strings.EqualFold(c, ".ssh"):
 			return pathErr(".ssh is off limits")
 		case i == len(parts)-1 && secretName(c):
@@ -85,7 +104,7 @@ func checkRelPath(p string) error {
 // and symlink resolution of every existing ancestor. If forWrite, an existing
 // symlink at the final component is refused outright.
 func safePath(root, rel string, forWrite bool) (string, error) {
-	if err := checkRelPath(rel); err != nil {
+	if err := checkPath(rel, forWrite); err != nil {
 		return "", err
 	}
 	realRoot, err := filepath.EvalSymlinks(root)
@@ -122,6 +141,9 @@ func safePath(root, rel string, forWrite bool) (string, error) {
 	for _, c := range strings.Split(filepath.ToSlash(relOut), "/") {
 		if isDotGit(c) {
 			return "", pathErr("resolves into .git")
+		}
+		if forWrite && isCIPath(c) {
+			return "", pathErr("resolves into CI/CD configuration")
 		}
 	}
 	return resolved, nil

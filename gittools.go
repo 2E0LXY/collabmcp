@@ -268,7 +268,7 @@ func (a *app) gitShow(ctx context.Context, agent string, in gitShowIn) (textOut,
 	}
 	var s string
 	if in.Path != "" {
-		if err := checkRelPath(in.Path); err != nil {
+		if err := checkRelPathRead(in.Path); err != nil {
 			return textOut{}, err
 		}
 		s, err = a.git.run(ctx, gitOpts{cwd: a.git.repoDir(p.Name)}, "show", "--no-textconv", in.Rev+":"+in.Path)

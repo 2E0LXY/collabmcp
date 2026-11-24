@@ -167,6 +167,7 @@ func purgeExpired(db *sql.DB) {
 	now := time.Now().Unix()
 	_, _ = db.Exec(`DELETE FROM oauth_codes WHERE expires < ?`, now)
 	_, _ = db.Exec(`DELETE FROM oauth_tokens WHERE expires < ?`, now)
+	purgeUnusedClients(db, time.Now())
 	_, _ = db.Exec(`DELETE FROM sessions WHERE expires < ?`, now)
 	_, _ = db.Exec(`DELETE FROM locks WHERE expires < ?`, now)
 	_, _ = db.Exec(`DELETE FROM audit WHERE ts < ?`, now-int64(auditRetention.Seconds()))

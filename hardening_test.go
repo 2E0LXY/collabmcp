@@ -297,3 +297,57 @@ func TestRefreshTokenConcurrentRedemption(t *testing.T) {
 		t.Fatalf("%d concurrent refreshes succeeded", ok)
 	}
 }
+
+func regReq(ip string) *http.Request {
+	r := httptest.NewRequest("POST", "/register", strings.NewReader(`{"client_name":"x","redirect_uris":["https://claude.ai/cb"]}`))
+	r.RemoteAddr = ip + ":1111"
+	return r
+}
+
+func TestRegisterPerIPRateLimit(t *testing.T) {
+	_, _, _, mux := webEnv(t)
+	for i := 0; i < registerPerIPHour; i++ {
+		if rr := doReq(mux, regReq("203.0.113.5")); rr.Code != 201 {
+			t.Fatalf("registration %d: %d", i, rr.Code)
+		}
+	}
+	if rr := doReq(mux, regReq("203.0.113.5")); rr.Code != 429 {
+		t.Fatalf("11th registration: %d", rr.Code)
+	}
+	if rr := doReq(mux, regReq("203.0.113.6")); rr.Code != 201 {
+		t.Fatalf("other IP blocked: %d", rr.Code)
+	}
+}
+
+func TestRegisterTotalCapAndPurgeOfUnusedClients(t *testing.T) {
+	a, _, _, mux := webEnv(t)
+	now := time.Now().Unix()
+	// 500 recent clients fill the cap.
+	for i := 0; i < maxClients; i++ {
+		_, _ = a.db.Exec(`INSERT INTO oauth_clients(id,name,redirect_uris,created) VALUES(?,?,?,?)`, "c"+strconv.Itoa(i), "n", "[]", now)
+	}
+	if rr := doReq(mux, regReq("203.0.113.7")); rr.Code != 503 {
+		t.Fatalf("cap not enforced: %d", rr.Code)
+	}
+	// Age 100 of them past 24 h: 50 are unused (purged), 50 completed authorisation (kept).
+	for i := 0; i < 100; i++ {
+		_, _ = a.db.Exec(`UPDATE oauth_clients SET created=? WHERE id=?`, now-25*3600, "c"+strconv.Itoa(i))
+	}
+	for i := 0; i < 50; i++ {
+		_, _ = a.db.Exec(`INSERT INTO oauth_tokens(hash,kind,client_id,agent,expires) VALUES(?,?,?,?,?)`, "h"+strconv.Itoa(i), "access", "c"+strconv.Itoa(i), "claude", now+3600)
+	}
+	if rr := doReq(mux, regReq("203.0.113.8")); rr.Code != 201 {
+		t.Fatalf("register after purge: %d %s", rr.Code, rr.Body)
+	}
+	var n, used int
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM oauth_clients`).Scan(&n)
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM oauth_clients WHERE id='c0'`).Scan(&used)
+	if n != maxClients-50+1 || used != 1 {
+		t.Fatalf("clients=%d (want %d), authorised client kept=%d", n, maxClients-50+1, used)
+	}
+	var gone int
+	_ = a.db.QueryRow(`SELECT COUNT(*) FROM oauth_clients WHERE id='c99'`).Scan(&gone)
+	if gone != 0 {
+		t.Fatal("unused old client not purged")
+	}
+}

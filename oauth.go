@@ -53,6 +53,46 @@ type authServer struct {
 	fails       map[string]*failState
 	global      []time.Time
 	globalUntil time.Time
+
+	regMu  sync.Mutex
+	regLog map[string][]time.Time
+}
+
+const (
+	maxClients         = 500
+	registerPerIPHour  = 10
+	unusedClientMaxAge = 24 * time.Hour
+	registerTrackedIPs = 10000
+)
+
+// registerAllowed applies the per-IP registration rate (registerPerIPHour per hour).
+func (a *authServer) registerAllowed(ip string) bool {
+	a.regMu.Lock()
+	defer a.regMu.Unlock()
+	now := time.Now()
+	if a.regLog == nil || len(a.regLog) > registerTrackedIPs {
+		a.regLog = map[string][]time.Time{}
+	}
+	keep := a.regLog[ip][:0]
+	for _, t := range a.regLog[ip] {
+		if now.Sub(t) < time.Hour {
+			keep = append(keep, t)
+		}
+	}
+	if len(keep) >= registerPerIPHour {
+		a.regLog[ip] = keep
+		return false
+	}
+	a.regLog[ip] = append(keep, now)
+	return true
+}
+
+// purgeUnusedClients removes clients older than 24 h that never completed authorisation
+// (no code or token was ever issued for them, or all of those have expired and been purged).
+func purgeUnusedClients(db *sql.DB, now time.Time) {
+	_, _ = db.Exec(`DELETE FROM oauth_clients WHERE created < ?
+		AND id NOT IN (SELECT client_id FROM oauth_tokens)
+		AND id NOT IN (SELECT client_id FROM oauth_codes)`, now.Add(-unusedClientMaxAge).Unix())
 }
 
 // credsOK checks username, password and (when enabled) the TOTP code.
@@ -186,6 +226,11 @@ func (a *authServer) routes(mux *http.ServeMux) {
 }
 
 func (a *authServer) register(w http.ResponseWriter, r *http.Request) {
+	if !a.registerAllowed(clientIP(r)) {
+		w.Header().Set("Retry-After", "3600")
+		oauthErr(w, 429, "temporarily_unavailable", "too many registrations from this address")
+		return
+	}
 	var req struct {
 		ClientName   string   `json:"client_name"`
 		RedirectURIs []string `json:"redirect_uris"`
@@ -206,10 +251,15 @@ func (a *authServer) register(w http.ResponseWriter, r *http.Request) {
 	}
 	id := randToken(16)
 	uris, _ := json.Marshal(req.RedirectURIs)
+	purgeUnusedClients(a.db, time.Now())
 	var n int
-	_ = a.db.QueryRow(`SELECT COUNT(*) FROM oauth_clients`).Scan(&n)
-	if n > 200 {
-		_, _ = a.db.Exec(`DELETE FROM oauth_clients WHERE created < ?`, time.Now().Add(-30*24*time.Hour).Unix())
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM oauth_clients`).Scan(&n); err != nil {
+		oauthErr(w, 500, "server_error", "")
+		return
+	}
+	if n >= maxClients {
+		oauthErr(w, 503, "temporarily_unavailable", "client registration is full")
+		return
 	}
 	if _, err := a.db.Exec(`INSERT INTO oauth_clients(id,name,redirect_uris,created) VALUES(?,?,?,?)`, id, name, string(uris), time.Now().Unix()); err != nil {
 		oauthErr(w, 500, "server_error", "")
